@@ -8,11 +8,16 @@
 #include "Eigen-3.3/Eigen/Core"
 #include "Eigen-3.3/Eigen/QR"
 #include "json.hpp"
+#include "spline.h"
 
 using namespace std;
 
 // for convenience
 using json = nlohmann::json;
+
+//Define CHALLENGE_TRACK for using Bosch challenge track, otherwise, comment this out.
+//#define CHALLENGE_TRACK
+
 
 // For converting back and forth between radians and degrees.
 constexpr double pi() { return M_PI; }
@@ -170,7 +175,11 @@ int main() {
   vector<double> map_waypoints_dy;
 
   // Waypoint map to read from
-  string map_file_ = "../data/highway_map.csv";
+  #ifdef CHALLENGE_TRACK
+  	string map_file_ = "../data/highway_map_bosch1.csv";
+  #else
+  	string map_file_ = "../data/highway_map.csv";
+  #endif
   // The max s value before wrapping around the track back to 0
   double max_s = 6945.554;
 
@@ -233,10 +242,548 @@ int main() {
           	// Sensor Fusion Data, a list of all other cars on the same side of the road.
           	auto sensor_fusion = j[1]["sensor_fusion"];
 
+			/////////////////////////////////////////////////////////////////////////////////////////////////
+			// Code starts here
+			/////////////////////////////////////////////////////////////////////////////////////////////////
+
+			#define DEBUG_ENABLE 1
+			#define MAX_SPEED 49.6
+
+			int prev_size = previous_path_x.size();
+
+
+			//start at lane 1
+			static int lane = 1;
+
+			//target reference velocity in mph
+			static double ref_vel = 0.0;
+
+			static double target_speed = MAX_SPEED;
+
+
+			//car driving behavior status
+			enum status { KEEP_LANE, 
+										CHANGE_TO_LEFT, 
+										CHANGE_TO_RIGHT, 
+										PREP_CHANGE_TO_LEFT, 
+										PREP_CHANGE_TO_RIGHT
+									};
+
+
+			//current status of the car
+			static status car_status = KEEP_LANE;
+
+			//create a list of widely spaced(x,y) waypoints, evenly spaced at 30m
+			//it will be extened with more point using spline
+			vector<double> ptsx;
+			vector<double> ptsy;
+
+			//reference starting x,y, yaw states
+			double ref_x;
+			double ref_y;
+			double ref_yaw;
+
+
+			//check for car that is going slowly infront of my car
+			bool too_close = false;
+
+			// structure to keep the important parameters of the surrounding cars
+			struct other_cars
+			{
+				double s;
+				double speed;
+			};
+
+			other_cars lane_0_front,   //on lane 0, the parameters of the car that is front to my car
+						 		 lane_0_back,    //on lane 0, the parameters of the car that is back to my car
+						 		 lane_1_front, 	 //on lane 1, the parameters of the car that is front to my car
+						 		 lane_1_back, 	 //on lane 1, the parameters of the car that is back to my car
+						 		 lane_2_front, 	 //on lane 2, the parameters of the car that is front to my car
+						 		 lane_2_back;		 //on lane 2, the parameters of the car that is back to my car
+
+			// temporary variable to calculate the nearest car			 		 
+			double lane_0_back_nearest, lane_0_front_nearest, lane_1_back_nearest, lane_1_front_nearest, 
+					lane_2_back_nearest, lane_2_front_nearest;
+
+			// initialize the surrounding car to farthest values			 		 
+			lane_0_front.s = 10000;
+			lane_0_front.speed = 23;
+			lane_0_back.s = -10000;
+			lane_0_back.speed = 23;
+			lane_1_front.s = 10000;
+			lane_1_front.speed = 23;
+			lane_1_back.s = -10000;
+			lane_1_back.speed = 23;
+			lane_2_front.s = 10000;
+			lane_2_front.speed = 23;
+			lane_2_back.s = -10000;
+			lane_2_back.speed = 23;
+			lane_0_back_nearest = 0;
+			lane_0_front_nearest = 10000;										
+			lane_1_back_nearest = 0;
+			lane_1_front_nearest = 10000;
+			lane_2_back_nearest = 0;
+			lane_2_front_nearest = 10000;
+
+
+			if(prev_size > 0)
+			{
+				car_s = end_path_s;
+			}
+
+			//convert car speed to m/s
+			car_speed = car_speed * 1600/(60*60);
+
+
+			#ifdef DEBUG_ENABLE
+			printf("\n************************ Sensor Fusion Data ************************************\n");
+			printf("id\td\ts\tspeed\n");
+			#endif		
+
+			//find the cars that are surrounding my car
+			for(int i = 0; i < sensor_fusion.size(); i++)
+				{					
+					
+					// Sensor fusion data for each care is [id, x, y, vx, vy, s, d]
+					float d = sensor_fusion[i][6];
+					double vx = sensor_fusion[i][3];
+					double vy = sensor_fusion[i][4];
+					double check_speed = sqrt(vx*vx + vy*vy);
+					double check_car_s = sensor_fusion[i][5];
+
+					#ifdef DEBUG_ENABLE
+					printf("%d\t%d\t%.2f\t%.2f\n",(int)sensor_fusion[i][0],(int)d/4,check_car_s,check_speed);
+					#endif
+					
+					if(d < 4)
+					{
+						if( car_s > check_car_s)
+						{
+							//car is behind
+							if(lane_0_back_nearest < check_car_s)
+							{
+								lane_0_back_nearest = check_car_s;
+								lane_0_back.s = check_car_s;
+								lane_0_back.speed = check_speed;
+							}
+						}
+						else 
+						{
+							//car is in front
+							if(lane_0_front_nearest > check_car_s)
+							{
+								lane_0_front_nearest = check_car_s;
+								lane_0_front.s = check_car_s;
+								lane_0_front.speed = check_speed;									
+							}							
+						}
+						
+					}
+					else if(d >= 4 && d < 8)
+					{
+						if( car_s > check_car_s)
+						{
+							//car is behind
+							if(lane_1_back_nearest < check_car_s)
+							{
+								lane_1_back_nearest = check_car_s;
+								lane_1_back.s = check_car_s;
+								lane_1_back.speed = check_speed;
+							}
+						}
+						else 
+						{
+							//car is in front
+							if(lane_1_front_nearest > check_car_s)
+							{
+								lane_1_front_nearest = check_car_s;
+								lane_1_front.s = check_car_s;
+								lane_1_front.speed = check_speed;									
+							}							
+						}						
+
+					}
+					else
+					{
+						if( car_s > check_car_s)
+						{
+							//car is behind
+							if(lane_2_back_nearest < check_car_s)
+							{
+								lane_2_back_nearest = check_car_s;
+								lane_2_back.s = check_car_s;
+								lane_2_back.speed = check_speed;
+							}
+						}
+						else 
+						{
+							//car is in front
+							if(lane_2_front_nearest > check_car_s)
+							{
+								lane_2_front_nearest = check_car_s;
+								lane_2_front.s = check_car_s;
+								lane_2_front.speed = check_speed;									
+							}							
+						}						
+					}
+				}
+
+			#ifdef DEBUG_ENABLE
+				printf("\n\n Extracted surrounding cars\n");
+				printf("\nlane\t delta s\t\t speed\n");
+				printf("0\t%.2f\t\t%.2f\n",lane_0_front.s - car_s, lane_0_front.speed);	
+				printf("0\t%.2f\t\t%.2f\n",lane_0_back.s - car_s, lane_0_back.speed);				
+				printf("\n1\t%.2f\t\t%.2f\n",lane_1_front.s - car_s, lane_1_front.speed);	
+				printf("1\t%.2f\t\t%.2f\n",lane_1_back.s - car_s, lane_1_back.speed);	
+				printf("\n2\t%.2f\t\t%.2f\n",lane_2_front.s - car_s, lane_2_front.speed);	
+				printf("2\t%.2f\t\t%.2f\n",lane_2_back.s - car_s, lane_2_back.speed);
+				printf("My car_lane= %d\tcar_s = %.2f\tcar_speed = %.2f\n\n",lane, car_s, car_speed);	
+			#endif			
+
+			
+			///////////////////////////////////////////////////////////////////////////////////////////////////
+			// Car Driving Behavior state machine
+			//////////////////////////////////////////////////////////////////////////////////////////////////
+
+			// minimum distance in time to start tracking the front vehicle speed	
+			#define SLOW_MOVE_MIN_TIME 0.5
+			// maximum distance in time to start considering overtaking the front vehicle 	
+			#define SLOW_MOVE_MAX_TIME 2.0
+			// minimum speed difference in the other lane car to that of front moving car to consider overtaking
+			#define MIN_SPEED_FAR_DIFF 2.0
+			// minimum distance in time between my car s to the other lanes' back car for safe overtaking	
+			#define BACK_CAR_MIN_TIME 1.0
+			// minimum distance in time between my car s to the other lanes' back car whose speed is faster than my car for safe overtaking	
+			#define BACK_CAR_FAST_MIN_TIME 	BACK_CAR_MIN_TIME*2
+			// relative distance in meters for safe overtaking 
+			#define FRONT_CAR_START_LC_S  10.0
+			// difference in front tracked speed to my car target speed for preventing collision
+			#define TRACK_SPEED_DIFF 1.0 	
+
+			switch(car_status)
+			{
+				case KEEP_LANE:
+
+					#ifdef DEBUG_ENABLE
+						printf("\ncar_status = KEEP_LANE\n");
+					#endif
+
+					if(0 == lane)
+					{	
+
+						//check for slower moving car infront at larger distances
+						if(((lane_0_front.s - car_s)/car_speed) < SLOW_MOVE_MAX_TIME)
+						{
+							//check if we can change lane
+							if(	(((car_speed > lane_1_back.speed) &&  ((car_s - lane_1_back.s)/car_speed > BACK_CAR_MIN_TIME)) || 
+										((lane_1_back.speed > car_speed) &&  ((car_s - lane_1_back.s)/(car_speed) > BACK_CAR_FAST_MIN_TIME))) &&
+									(((lane_1_front.s - car_s) - (lane_0_front.s - car_s)) > FRONT_CAR_START_LC_S) &&
+									((lane_0_front.speed < MAX_SPEED) )
+							  )
+							{
+									car_status = PREP_CHANGE_TO_RIGHT;
+							}
+
+							if(((lane_0_front.s - car_s)/car_speed < SLOW_MOVE_MIN_TIME))
+							{
+								//can not change the lane, try for matching the speed to the car in front
+								target_speed = lane_0_front.speed;
+								too_close = true;
+							}
+						}
+						else
+						{
+							//keep lane
+						}
+
+					}
+					else if(2 == lane)
+					{
+						//check for slower moving car infront at larger distances
+						if(((lane_2_front.s - car_s)/car_speed) < SLOW_MOVE_MAX_TIME)
+						{
+							//check if we can change lane
+							if(	(((car_speed > lane_1_back.speed) &&  ((car_s - lane_1_back.s)/car_speed > BACK_CAR_MIN_TIME)) || 
+										((lane_1_back.speed > car_speed) &&  ((car_s - lane_1_back.s)/(car_speed) > BACK_CAR_FAST_MIN_TIME))) &&
+									(((lane_1_front.s - car_s) - (lane_2_front.s - car_s)) > FRONT_CAR_START_LC_S) &&
+									((lane_2_front.speed < MAX_SPEED))
+							  )
+							{
+									car_status = PREP_CHANGE_TO_LEFT;
+							}
+
+							if(((lane_2_front.s - car_s)/car_speed < SLOW_MOVE_MIN_TIME))
+							{
+								//can not change the lane, try for matching the speed to the car in front
+								target_speed = lane_2_front.speed;
+								too_close = true;
+							}
+						}
+						else
+						{
+							//keep lane
+						}	
+					}
+					else // if my car is in lane 1
+					{
+
+						//check for slower moving car infront at larger distances
+						if(((lane_1_front.s - car_s)/car_speed) < SLOW_MOVE_MAX_TIME)
+						{
+							bool lane_0_overtake_ready = false;
+							bool lane_2_overtake_ready = false;
+							
+							//check if we can change lane to lane 0
+							if( (((car_speed > lane_0_back.speed) &&  ((car_s - lane_0_back.s)/car_speed > BACK_CAR_MIN_TIME)) || 
+										((lane_0_back.speed > car_speed) &&  ((car_s - lane_0_back.s)/(car_speed) > BACK_CAR_FAST_MIN_TIME))) &&
+								(((lane_0_front.s - car_s) - (lane_1_front.s - car_s)) > FRONT_CAR_START_LC_S) &&
+								((lane_1_front.speed < MAX_SPEED) ) 
+							  )
+							{
+								lane_0_overtake_ready = true;	
+							} 
+
+							if( (((car_speed > lane_2_back.speed) &&  ((car_s - lane_2_back.s)/car_speed > BACK_CAR_MIN_TIME)) || 
+										((lane_2_back.speed > car_speed) &&  ((car_s - lane_2_back.s)/(car_speed) > BACK_CAR_FAST_MIN_TIME))) &&
+								(((lane_2_front.s - car_s)- (lane_1_front.s - car_s)) > FRONT_CAR_START_LC_S) &&
+								((lane_1_front.speed < MAX_SPEED)) 
+							  )
+							{
+								lane_2_overtake_ready = true;	
+							} 
+
+							//check for relatively farther car in lane 0 and lane 2
+							if(lane_0_front.s > lane_2_front.s)
+							{
+								if(true == lane_0_overtake_ready)
+								{
+									car_status = PREP_CHANGE_TO_LEFT;
+								}
+								else if(true == lane_2_overtake_ready)
+								{
+									car_status = PREP_CHANGE_TO_RIGHT;
+								}
+							}
+							else
+							{
+								if(true == lane_2_overtake_ready)
+								{
+									car_status = PREP_CHANGE_TO_RIGHT;
+								}
+								else if(true == lane_0_overtake_ready)
+								{
+									car_status = PREP_CHANGE_TO_LEFT;
+								}
+
+							}
+
+							#ifdef DEBUG_ENABLE
+								printf("\nlane_0_overtake_ready = %d \t lane_2_overtake_ready = %d", lane_0_overtake_ready, lane_2_overtake_ready);
+							#endif
+
+							if(((lane_1_front.s - car_s)/car_speed < SLOW_MOVE_MIN_TIME))
+							{
+								//can not change the lane, try for matching the speed to the car in front
+								target_speed = lane_1_front.speed;
+								too_close = true;
+							}
+						}
+						else
+						{
+							//keep lane
+						}					
+					}	
+					break;
+
+					case PREP_CHANGE_TO_LEFT:
+						#ifdef DEBUG_ENABLE
+							printf("\ncar_status = PREP_CHANGE_TO_LEFT\n");			
+						#endif		
+						lane = lane -1;
+						car_status = CHANGE_TO_LEFT;
+						break;
+
+					case PREP_CHANGE_TO_RIGHT:
+						#ifdef DEBUG_ENABLE
+							printf("\ncar_status = PREP_CHANGE_TO_RIGHT\n");
+						#endif						
+						lane = lane + 1;
+						car_status = CHANGE_TO_RIGHT;
+						break;
+
+					case CHANGE_TO_LEFT:
+						#ifdef DEBUG_ENABLE
+							printf("\ncar_status = CHANGE_TO_LEFT\n");
+						#endif						
+						//check if we are in the center of the lane
+						if( fabs((2+4*lane) - car_d) < 1.0 )
+						{
+							//change to keep lane state
+							car_status = KEEP_LANE;
+						}
+						break;
+
+					case CHANGE_TO_RIGHT:
+						#ifdef DEBUG_ENABLE
+							printf("\ncar_status = CHANGE_TO_RIGHT\n");
+						#endif					
+						//check if we are in the center of the lane
+						if( fabs((2+4*lane) - car_d) < 1.0 )
+						{
+							//change to keep lane state
+							car_status = KEEP_LANE;
+						}
+						break;
+
+					default:
+						car_status = KEEP_LANE;
+
+			}
+
+			#ifdef DEBUG_ENABLE
+				printf("\n Target_tracking = %d \t Tracking Speed = %.2f\n",too_close, target_speed);
+			#endif
+
+			if(prev_size < 2)
+			//use where car is at(localization) as starting reference
+			{
+
+				ref_x = car_x;
+				ref_y = car_y;
+				ref_yaw = deg2rad(car_yaw);
+
+				//use two points that are tangent to the car
+				double prev_car_x = car_x - cos(car_yaw);
+				double prev_car_y = car_y - sin(car_yaw);
+
+				ptsx.push_back(prev_car_x);
+				ptsx.push_back(ref_x);
+
+				ptsy.push_back(prev_car_y);
+				ptsy.push_back(ref_y);
+			}
+			//use previous path end points as starting reference
+			else
+			{
+				ref_x = previous_path_x[prev_size-1];
+				ref_y = previous_path_y[prev_size-1];
+
+				double ref_x_prev = previous_path_x[prev_size-2];
+				double ref_y_prev = previous_path_y[prev_size-2];
+				ref_yaw = atan2(ref_y-ref_y_prev,ref_x-ref_x_prev);
+
+				//use the two points that make the path tangent to the previous
+				// path's end point
+				ptsx.push_back(ref_x_prev);
+				ptsx.push_back(ref_x);
+
+				ptsy.push_back(ref_y_prev);
+				ptsy.push_back(ref_y);
+			}
+
+			//Add 30m evenly spaced points ahead of starting reference
+			int spacing = 30; 
+
+			vector<double> next_wp0 = getXY(car_s+spacing,(2+4*lane),map_waypoints_s,
+			                                map_waypoints_x, map_waypoints_y);
+			vector<double> next_wp1 = getXY(car_s+spacing*2,(2+4*lane),map_waypoints_s,
+			                                map_waypoints_x, map_waypoints_y);
+			vector<double> next_wp2 = getXY(car_s+spacing*3,(2+4*lane),map_waypoints_s,
+			                                map_waypoints_x, map_waypoints_y);
+				
+			ptsx.push_back(next_wp0[0]);
+			ptsx.push_back(next_wp1[0]);
+			ptsx.push_back(next_wp2[0]);
+
+			ptsy.push_back(next_wp0[1]);
+			ptsy.push_back(next_wp1[1]);
+			ptsy.push_back(next_wp2[1]);
+
+			//shift the car reference angle to 0 degrees
+			for(int i = 0; i< ptsx.size(); i++)
+			{
+				double shift_x = ptsx[i] - ref_x;
+				double shift_y = ptsy[i] - ref_y;
+
+				ptsx[i] = (shift_x * cos(0-ref_yaw)-shift_y * sin(0-ref_yaw));
+				ptsy[i] = (shift_x * sin(0-ref_yaw)+shift_y * cos(0-ref_yaw));
+			}
+
+			//tragectory generation///////////////////////////////////////
+
+			//create a spline
+			tk::spline s;
+
+			//set (x,y) points to the spline
+			s.set_points(ptsx,ptsy);
+
+			//define the actual (x,y) which we will use for the trajectory
+			vector<double> next_x_vals;
+			vector<double> next_y_vals;
+
+			//start with all of the prvious path points from last time to ensure
+			//smooth transition
+			for(int  i = 0; i < previous_path_x.size(); i++)
+			{
+				next_x_vals.push_back(previous_path_x[i]);
+				next_y_vals.push_back(previous_path_y[i]);
+			}
+				
+			
+			//calculate how to break up spline points so that we travel at our
+			//desired reference velocity
+			double target_x = 30.0; //meters 
+			double target_y = s(target_x);
+			double target_dist = sqrt((target_x)*(target_x) + (target_y)*(target_y));
+
+			double x_add_on = 0;
+
+			//fill up the rest of the path with 50 points after filling with previous points
+			for(int i = 0; i <= 50-previous_path_x.size(); i++)
+			{
+				
+				if(true == too_close)
+				{
+					if(ref_vel > ((target_speed-TRACK_SPEED_DIFF)*60*60/(1600)))
+					{
+						ref_vel -= 0.224*1.25;						
+					}
+
+				}
+				else if(ref_vel < MAX_SPEED)
+				{
+					ref_vel += 0.224*1.25;
+				}
+
+				double N = (target_dist/(0.02*ref_vel/2.24));
+				double x_point = x_add_on+(target_x)/N;
+				double y_point = s(x_point);
+
+				x_add_on = x_point;
+
+				double x_ref = x_point;
+				double y_ref = y_point;
+
+				//shift the reference co-ordinate to map co-ordinates
+				x_point = (x_ref*cos(ref_yaw) - y_ref*sin(ref_yaw));
+				y_point = (x_ref*sin(ref_yaw) + y_ref*cos(ref_yaw));
+
+				x_point += ref_x;
+				y_point += ref_y;
+
+				next_x_vals.push_back(x_point);
+				next_y_vals.push_back(y_point);
+			}
+
+	
+			/////////////////////////////////////////////////////////////////
+			//end code/////////////////////////////////////////////////////
+			/////////////////////////////////////////////////////////////////
+
           	json msgJson;
 
-          	vector<double> next_x_vals;
-          	vector<double> next_y_vals;
+          	//vector<double> next_x_vals;
+          	//vector<double> next_y_vals;
 
 
           	// TODO: define a path made up of (x,y) points that the car will visit sequentially every .02 seconds
